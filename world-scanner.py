@@ -24,7 +24,7 @@ from pathlib import Path
 
 # ── Config ──
 AISA_KEY = os.getenv("OPENROUTER_API_KEY", "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")
-AISA_URL = "https://openrouter.ai/api/v1/chat/completions"
+AISA_URL = "http://localhost:11434/v1/chat/completions"
 WAHA_URL = "http://localhost:3000"
 WAHA_KEY = "wella-api-key-2026"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7840025314:AAFO2M9xhyOap3DGeOA6Q2XlMfqhgp40nW4")
@@ -262,7 +262,7 @@ Write ONLY the message."""
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 AISA_URL,
-                json={"model": "stepfun/step-3.5-flash:free", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 250},
+                json={"model": "mistral:7b", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 250},
                 headers={"Authorization": f"Bearer {AISA_KEY}", "Content-Type": "application/json"},
             )
             pitch = resp.json()["choices"][0]["message"]["content"]

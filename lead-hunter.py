@@ -14,7 +14,7 @@ import httpx
 from datetime import datetime
 
 AISA_KEY = os.getenv("OPENROUTER_API_KEY", "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")
-AISA_URL = "https://openrouter.ai/api/v1/chat/completions"
+AISA_URL = "http://localhost:11434/v1/chat/completions"
 CRM_DIR = "/home/sagcan/.openclaw/workspace/salon-crm"
 GIT_TOKEN = "os.getenv("GIT_TOKEN", "")"
 
@@ -139,7 +139,7 @@ Sadece mesajı yaz."""
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 AISA_URL,
-                json={"model": "stepfun/step-3.5-flash:free", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 250},
+                json={"model": "mistral:7b", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 250},
                 headers={"Authorization": f"Bearer {AISA_KEY}", "Content-Type": "application/json"},
             )
             return resp.json()["choices"][0]["message"]["content"]
