@@ -12,11 +12,19 @@ import re
 import asyncio
 import httpx
 from datetime import datetime
+from pathlib import Path
 
-AISA_KEY = os.getenv("OPENROUTER_API_KEY", "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")
-AISA_URL = "http://localhost:11434/v1/chat/completions"
-CRM_DIR = "/home/sagcan/.openclaw/workspace/salon-crm"
-GIT_TOKEN = "os.getenv("GIT_TOKEN", "")"
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/v1/chat/completions")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b")
+GOOGLE_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
+CRM_DIR = Path(os.getenv("CRM_DIR", Path(__file__).parent))
+GIT_TOKEN = os.getenv("GIT_TOKEN", "")
 
 # Sektör bazlı sorun tespiti ve pitch
 SECTOR_CONFIG = {
@@ -91,11 +99,10 @@ SECTOR_CONFIG = {
 
 def get_sector(keyword: str) -> dict:
     """Anahtar kelimeye göre sektör config'i döndür"""
-    keyword = keyword.lower()
+    keyword_lower = keyword.lower()
     for key, config in SECTOR_CONFIG.items():
-        if key in keyword or any(t in keyword for t in config["search_terms"]):
+        if key in keyword_lower or any(t in keyword_lower for t in config["search_terms"]):
             return {**config, "key": key}
-    # Bilinmeyen sektör — genel config
     return {
         "key": keyword.replace(" ", "-"),
         "search_terms": [keyword],
@@ -110,8 +117,50 @@ def get_sector(keyword: str) -> dict:
     }
 
 
+async def search_google_places(query: str, city: str) -> list:
+    """Google Places API ile lead ara"""
+    if not GOOGLE_API_KEY:
+        return []
+
+    leads = []
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                params={"query": f"{query} {city}", "key": GOOGLE_API_KEY, "language": "tr"},
+            )
+            data = resp.json()
+
+            for place in data.get("results", [])[:20]:
+                detail_resp = await client.get(
+                    "https://maps.googleapis.com/maps/api/place/details/json",
+                    params={
+                        "place_id": place["place_id"],
+                        "fields": "name,formatted_phone_number,international_phone_number,website,formatted_address,rating,user_ratings_total",
+                        "key": GOOGLE_API_KEY,
+                        "language": "tr",
+                    },
+                )
+                detail = detail_resp.json().get("result", {})
+                phone = detail.get("international_phone_number", "") or detail.get("formatted_phone_number", "")
+                leads.append({
+                    "name": detail.get("name", place.get("name", "")),
+                    "phone": phone,
+                    "address": detail.get("formatted_address", ""),
+                    "website": detail.get("website", ""),
+                    "rating": str(detail.get("rating", "")),
+                    "reviews": str(detail.get("user_ratings_total", "")),
+                    "city": city,
+                })
+                await asyncio.sleep(0.1)
+    except Exception as e:
+        print(f"❌ Google Places API hatası: {e}")
+
+    return leads
+
+
 async def generate_sector_pitch(lead: dict, sector: dict, issues: list) -> str:
-    """Sektöre özel kişiselleştirilmiş mesaj üret"""
+    """Sektöre özel kişiselleştirilmiş mesaj üret (Ollama)"""
     prompt = f"""Bir dijital pazarlama uzmanısın. Bir işletmeye WhatsApp mesajı yazacaksın.
 
 İŞLETME:
@@ -124,7 +173,7 @@ SEKTÖREL SORUNLAR:
 {chr(10).join(f"- {p}" for p in sector['pain_points'][:2])}
 
 DİJİTAL EKSİKLER:
-{chr(10).join(f"- {i}" for i in issues[:2])}
+{chr(10).join(f"- {i}" for i in issues[:2]) if issues else "- Genel dijital eksiklik"}
 
 ÇÖZÜM: {sector['solution']}
 
@@ -138,27 +187,38 @@ Sadece mesajı yaz."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                AISA_URL,
-                json={"model": "mistral:7b", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 250},
-                headers={"Authorization": f"Bearer {AISA_KEY}", "Content-Type": "application/json"},
+                OLLAMA_URL,
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.7,
+                    "max_tokens": 250,
+                },
+                headers={"Content-Type": "application/json"},
             )
-            return resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"Merhaba {lead['name']}! İşletmeniz için geliştirdiğimiz dijital yönetim sistemini göstermek isteriz. İlk ay tamamen ücretsiz. Demo için yazabilirsiniz 🙌 — Fatih, FS Roket Teknoloji"
+            return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return (
+            f"Merhaba *{lead['name']}*! İşletmeniz için geliştirdiğimiz dijital yönetim "
+            f"sistemini göstermek isteriz. İlk ay tamamen ücretsiz. "
+            f"Demo için yazabilirsiniz 🙌 — Fatih, FS Roket Teknoloji"
+        )
 
 
-def create_crm_file(lead: dict, sector: dict, pitch: str, issues: list):
-    """CRM dosyası oluştur"""
+def create_crm_file(lead: dict, sector: dict, pitch: str, issues: list) -> str:
+    """CRM markdown dosyası oluştur"""
     name = lead["name"]
-    slug = re.sub(r'[^a-z0-9]+', '-', name.lower()
-        .replace('ö','o').replace('ü','u').replace('ş','s')
-        .replace('ç','c').replace('ı','i').replace('ğ','g')
-        .replace('İ','i').replace('Ö','O').replace('Ü','U')
+    slug = re.sub(
+        r'[^a-z0-9]+', '-',
+        name.lower()
+        .replace('ö', 'o').replace('ü', 'u').replace('ş', 's')
+        .replace('ç', 'c').replace('ı', 'i').replace('ğ', 'g')
+        .replace('İ', 'i').replace('Ö', 'o').replace('Ü', 'u')
     ).strip('-')
-    
-    folder = f"{CRM_DIR}/leads/{lead.get('city','genel')}/{sector['crm_folder']}"
-    os.makedirs(folder, exist_ok=True)
-    
+
+    folder = CRM_DIR / "leads" / lead.get('city', 'genel') / sector['crm_folder']
+    folder.mkdir(parents=True, exist_ok=True)
+
     content = f"""# {name}
 **Durum:** ⬜ Hazır (mesaj gönderilmedi)
 **Sektör:** {sector['key']}
@@ -177,13 +237,13 @@ def create_crm_file(lead: dict, sector: dict, pitch: str, issues: list):
 """
     for p in sector['pain_points']:
         content += f"- {p}\n"
-    
-    content += f"""
-## Dijital Analiz
-"""
+
+    content += "\n## Dijital Analiz\n"
     for i in issues:
         content += f"- ❌ {i}\n"
-    
+    if not issues:
+        content += "- Analiz yapılmadı\n"
+
     content += f"""
 ## Hazırlanan Mesaj
 ```
@@ -195,19 +255,58 @@ def create_crm_file(lead: dict, sector: dict, pitch: str, issues: list):
 |-------|--------|-------|
 
 ## Notlar
-- Lead {datetime.now().strftime('%Y-%m-%d')} tarihinde Google Maps'ten toplandı
+- Lead {datetime.now().strftime('%Y-%m-%d')} tarihinde toplandı
 """
-    
-    filepath = f"{folder}/{slug}.md"
+
+    filepath = folder / f"{slug}.md"
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(content)
-    return filepath
+    return str(filepath)
 
 
 def git_push(message: str):
-    """CRM'i GitHub'a push et"""
-    os.system(f'cd {CRM_DIR} && git add -A && git commit -m "{message}" --quiet 2>/dev/null')
-    os.system(f'cd {CRM_DIR} && git push --quiet 2>/dev/null')
+    """Değişiklikleri GitHub'a push et"""
+    os.system(f'cd "{CRM_DIR}" && git add -A && git commit -m "{message}" --quiet 2>/dev/null')
+    os.system(f'cd "{CRM_DIR}" && git push --quiet 2>/dev/null')
+
+
+async def run(sector_name: str, city: str):
+    sector = get_sector(sector_name)
+    print(f"🔍 Sektör: {sector['key']} | Şehir: {city}")
+
+    # Google Places API ile ara
+    leads = []
+    if GOOGLE_API_KEY:
+        print(f"🌐 Google Places API ile aranıyor: {sector['search_terms'][0]} {city}")
+        leads = await search_google_places(sector['search_terms'][0], city)
+        print(f"📊 {len(leads)} işletme bulundu")
+    else:
+        print("⚠️  GOOGLE_PLACES_API_KEY ayarlanmamış.")
+        print("   .env dosyasına ekleyin veya export GOOGLE_PLACES_API_KEY=... kullanın.")
+        print(f"   Manuel alternatif: https://www.google.com/maps/search/{sector['search_terms'][0]}+{city}")
+        return
+
+    if not leads:
+        print("❌ Hiç lead bulunamadı.")
+        return
+
+    created = 0
+    for lead in leads:
+        issues = []
+        if not lead.get("website"):
+            issues.append("Website yok")
+        if int(lead.get("reviews", "0") or "0") < 50:
+            issues.append("Az Google yorumu")
+
+        print(f"   🤖 AI mesajı üretiliyor: {lead['name']}")
+        pitch = await generate_sector_pitch(lead, sector, issues)
+
+        filepath = create_crm_file(lead, sector, pitch, issues)
+        print(f"   ✅ {lead['name']} → {filepath.split('/')[-1]}")
+        created += 1
+
+    git_push(f"🎯 Lead Hunter: {sector['key']} {city} — {created} lead")
+    print(f"\n✅ {created} lead CRM'e eklendi ve push edildi.")
 
 
 if __name__ == "__main__":
@@ -223,16 +322,11 @@ if __name__ == "__main__":
         print('  python3 lead-hunter.py "oto servis" "kocaeli"')
         print()
         print(f"Desteklenen sektörler: {', '.join(SECTOR_CONFIG.keys())}")
+        print()
+        print("Gerekli .env değişkenleri:")
+        print("  GOOGLE_PLACES_API_KEY  — Google Places API anahtarı (zorunlu)")
+        print("  OLLAMA_URL             — Ollama endpoint (varsayılan: http://localhost:11434/v1/chat/completions)")
+        print("  OLLAMA_MODEL           — Model adı (varsayılan: mistral:7b)")
         sys.exit(0)
-    
-    sector_name = sys.argv[1]
-    city = sys.argv[2]
-    
-    sector = get_sector(sector_name)
-    print(f"🔍 Sektör: {sector['key']} | Şehir: {city}")
-    print(f"📋 Arama terimleri: {sector['search_terms']}")
-    print(f"🎯 CRM klasörü: leads/{city}/{sector['crm_folder']}/")
-    print()
-    print("⚠️  Google Maps scraping için browser tool gerekli.")
-    print("    NICO'ya söyle: 'lead-hunter çalıştır, [sektör] [şehir]'")
-    print(f"    Browser'da ara: https://www.google.com/maps/search/{sector['search_terms'][0]}+{city}")
+
+    asyncio.run(run(sys.argv[1], sys.argv[2]))

@@ -22,14 +22,20 @@ import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # ── Config ──
-AISA_KEY = os.getenv("OPENROUTER_API_KEY", "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")
-AISA_URL = "http://localhost:11434/v1/chat/completions"
-WAHA_URL = "http://localhost:3000"
-WAHA_KEY = "wella-api-key-2026"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7840025314:AAFO2M9xhyOap3DGeOA6Q2XlMfqhgp40nW4")
-TELEGRAM_CHAT = "8392825203"
-CRM_DIR = Path("/home/sagcan/.openclaw/workspace/salon-crm")
+AISA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/v1/chat/completions")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b")
+WAHA_URL = os.getenv("WAHA_URL", "http://localhost:3000")
+WAHA_KEY = os.getenv("WAHA_API_KEY", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+CRM_DIR = Path(os.getenv("CRM_DIR", Path(__file__).parent))
 LEADS_DB = CRM_DIR / "leads-db.json"
 QUEUE_FILE = CRM_DIR / "send-queue.json"
 STATS_FILE = CRM_DIR / "stats.json"
@@ -262,8 +268,8 @@ Write ONLY the message."""
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 AISA_URL,
-                json={"model": "mistral:7b", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 250},
-                headers={"Authorization": f"Bearer {AISA_KEY}", "Content-Type": "application/json"},
+                json={"model": OLLAMA_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 250},
+                headers={"Content-Type": "application/json"},
             )
             pitch = resp.json()["choices"][0]["message"]["content"]
     except:
@@ -477,7 +483,7 @@ async def main():
         print(f"\n🎯 TOPLAM: {total} lead toplandı")
         
         # Git push
-        os.system(f'cd {CRM_DIR} && git add -A && git commit -m "🌍 Scan: {sector} {country} — {total} lead" --quiet 2>/dev/null && git push --quiet 2>/dev/null')
+        os.system(f'cd "{CRM_DIR}" && git add -A && git commit -m "🌍 Scan: {sector} {country} — {total} lead" --quiet 2>/dev/null && git push --quiet 2>/dev/null')
     
     elif cmd == "send":
         count = 20

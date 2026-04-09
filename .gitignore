@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+leads-db.json
+send-queue.json
+stats.json
