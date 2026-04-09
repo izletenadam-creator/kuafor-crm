@@ -59,6 +59,7 @@ COUNTRY_CONFIG = {
 SECTORS = {
     "kuaför": {
         "search": {"tr": "kuaför", "en": "hair salon", "de": "friseur", "fr": "coiffeur", "nl": "kapper", "ar": "صالون تجميل"},
+        "osm_tag": "shop=hairdresser",
         "folder": "kuafor",
         "pain_points": {
             "tr": ["Randevu karışıklığı", "Telefona yetişememe", "Müşteri takibi yok", "Kampanya yapamama"],
@@ -68,38 +69,47 @@ SECTORS = {
     },
     "diş": {
         "search": {"tr": "diş kliniği", "en": "dental clinic", "de": "zahnarzt", "fr": "dentiste", "nl": "tandarts", "ar": "عيادة أسنان"},
+        "osm_tag": "amenity=dentist",
         "folder": "dis",
     },
     "veteriner": {
         "search": {"tr": "veteriner", "en": "veterinary clinic", "de": "tierarzt", "fr": "vétérinaire", "nl": "dierenarts", "ar": "عيادة بيطرية"},
+        "osm_tag": "amenity=veterinary",
         "folder": "veteriner",
     },
     "emlak": {
         "search": {"tr": "emlak ofisi", "en": "real estate agency", "de": "immobilienmakler", "fr": "agence immobilière", "nl": "makelaar", "ar": "مكتب عقارات"},
+        "osm_tag": "office=estate_agent",
         "folder": "emlak",
     },
     "restoran": {
         "search": {"tr": "restoran", "en": "restaurant", "de": "restaurant", "fr": "restaurant", "nl": "restaurant", "ar": "مطعم"},
+        "osm_tag": "amenity=restaurant",
         "folder": "restoran",
     },
     "oto": {
         "search": {"tr": "oto servis", "en": "auto repair shop", "de": "autowerkstatt", "fr": "garage automobile", "nl": "autogarage", "ar": "ورشة سيارات"},
+        "osm_tag": "shop=car_repair",
         "folder": "oto",
     },
     "eczane": {
         "search": {"tr": "eczane", "en": "pharmacy", "de": "apotheke", "fr": "pharmacie", "nl": "apotheek", "ar": "صيدلية"},
+        "osm_tag": "amenity=pharmacy",
         "folder": "eczane",
     },
     "spor": {
         "search": {"tr": "spor salonu", "en": "gym", "de": "fitnessstudio", "fr": "salle de sport", "nl": "sportschool", "ar": "صالة رياضية"},
+        "osm_tag": "leisure=fitness_centre",
         "folder": "spor",
     },
     "otel": {
         "search": {"tr": "otel", "en": "hotel", "de": "hotel", "fr": "hôtel", "nl": "hotel", "ar": "فندق"},
+        "osm_tag": "tourism=hotel",
         "folder": "otel",
     },
     "avukat": {
         "search": {"tr": "avukat", "en": "law firm", "de": "rechtsanwalt", "fr": "avocat", "nl": "advocaat", "ar": "محامي"},
+        "osm_tag": "office=lawyer",
         "folder": "avukat",
     },
 }
@@ -132,6 +142,61 @@ def save_db(db: dict):
 def lead_id(name: str, phone: str) -> str:
     """Unique lead ID"""
     return hashlib.md5(f"{name}:{phone}".encode()).hexdigest()[:12]
+
+
+async def search_overpass(osm_tag: str, city: str, country: str) -> list:
+    """OpenStreetMap Overpass API — API key gerekmez, ücretsiz"""
+    key, value = osm_tag.split("=", 1)
+    country_cfg = COUNTRY_CONFIG.get(country, {})
+    country_name = country_cfg.get("name", country)
+    headers = {"User-Agent": "kuafor-crm/1.0 (world-scanner)"}
+
+    try:
+        async with httpx.AsyncClient(timeout=25, headers=headers) as client:
+            geo = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": f"{city}, {country_name}", "format": "json", "limit": 1},
+            )
+            geo_data = geo.json()
+            if not geo_data:
+                return []
+
+            south, north, west, east = geo_data[0]["boundingbox"]
+            await asyncio.sleep(1)
+
+            query = f"""[out:json][timeout:30];
+(
+  node["{key}"="{value}"]({south},{west},{north},{east});
+  way["{key}"="{value}"]({south},{west},{north},{east});
+);
+out body 60;"""
+
+            ov = await client.post("https://overpass-api.de/api/interpreter", data=query)
+            elements = ov.json().get("elements", [])
+
+            leads = []
+            for el in elements:
+                tags = el.get("tags", {})
+                name = tags.get("name") or tags.get(f"name:{country_cfg.get('lang','en')}", "")
+                if not name:
+                    continue
+                phone = tags.get("phone") or tags.get("contact:phone", "")
+                website = tags.get("website") or tags.get("contact:website", "")
+                street = tags.get("addr:street", "")
+                housenumber = tags.get("addr:housenumber", "")
+                address = f"{street} {housenumber}".strip() or city
+                leads.append({
+                    "name": name,
+                    "phone": phone,
+                    "website": website,
+                    "address": address,
+                    "city": city,
+                    "source": "openstreetmap",
+                })
+            return leads
+    except Exception as e:
+        print(f"   ❌ Overpass hatası: {e}")
+        return []
 
 
 async def search_google_maps(query: str, city: str, country: str, lang: str) -> list:
@@ -295,8 +360,14 @@ async def scan_city(sector: str, city: str, country: str):
     print(f"\n🔍 Taranıyor: {search_term} — {city} ({country})")
     
     leads = await search_google_maps(search_term, city, country, lang)
+
+    # Google Places boş döndüyse OpenStreetMap ile dene
+    if not leads and sector_cfg.get("osm_tag"):
+        print(f"   🗺️  OpenStreetMap fallback...")
+        leads = await search_overpass(sector_cfg["osm_tag"], city, country)
+
     print(f"   📊 {len(leads)} lead bulundu")
-    
+
     if not leads:
         return []
     

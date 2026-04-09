@@ -30,6 +30,7 @@ GIT_TOKEN = os.getenv("GIT_TOKEN", "")
 SECTOR_CONFIG = {
     "kuaför": {
         "search_terms": ["kuaför", "güzellik salonu", "bayan kuaför", "hair salon"],
+        "osm_tag": "shop=hairdresser",
         "crm_folder": "kuaforler",
         "pain_points": [
             "Randevu karışıklığı — müşteri geldi ama sıra yok",
@@ -41,6 +42,7 @@ SECTOR_CONFIG = {
     },
     "diş": {
         "search_terms": ["diş kliniği", "diş doktoru", "dental klinik", "ağız diş sağlığı"],
+        "osm_tag": "amenity=dentist",
         "crm_folder": "dis-klinikleri",
         "pain_points": [
             "Randevu iptalleri — hasta gelmiyor, slot boş kalıyor",
@@ -52,6 +54,7 @@ SECTOR_CONFIG = {
     },
     "veteriner": {
         "search_terms": ["veteriner", "veteriner kliniği", "pet klinik"],
+        "osm_tag": "amenity=veterinary",
         "crm_folder": "veterinerler",
         "pain_points": [
             "Aşı takibi — hayvanların aşı takvimi kaçırılıyor",
@@ -63,6 +66,7 @@ SECTOR_CONFIG = {
     },
     "emlak": {
         "search_terms": ["emlakçı", "emlak ofisi", "gayrimenkul"],
+        "osm_tag": "office=estate_agent",
         "crm_folder": "emlakcilar",
         "pain_points": [
             "Müşteri kaybı — arayan kişiye hemen dönüş yapılamıyor",
@@ -74,6 +78,7 @@ SECTOR_CONFIG = {
     },
     "restoran": {
         "search_terms": ["restoran", "restaurant", "lokanta", "cafe"],
+        "osm_tag": "amenity=restaurant",
         "crm_folder": "restoranlar",
         "pain_points": [
             "Rezervasyon karışıklığı — telefonla takip edilemiyor",
@@ -85,6 +90,7 @@ SECTOR_CONFIG = {
     },
     "oto": {
         "search_terms": ["oto servis", "oto yıkama", "araç servis", "oto tamir"],
+        "osm_tag": "shop=car_repair",
         "crm_folder": "oto-servisler",
         "pain_points": [
             "Bakım hatırlatması — müşteriler periyodik bakımı unutuyor",
@@ -157,6 +163,69 @@ async def search_google_places(query: str, city: str) -> list:
         print(f"❌ Google Places API hatası: {e}")
 
     return leads
+
+
+async def search_overpass(osm_tag: str, city: str) -> list:
+    """OpenStreetMap Overpass API ile ücretsiz lead ara — API key gerekmez"""
+    key, value = osm_tag.split("=", 1)
+    headers = {"User-Agent": "kuafor-crm/1.0 (lead-hunter)"}
+
+    try:
+        async with httpx.AsyncClient(timeout=20, headers=headers) as client:
+            # Nominatim ile şehri geocode et → bounding box al
+            geo = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": city, "format": "json", "limit": 1, "countrycodes": "tr"},
+            )
+            geo_data = geo.json()
+            if not geo_data:
+                # Ülke kodu olmadan dene
+                geo = await client.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": city, "format": "json", "limit": 1},
+                )
+                geo_data = geo.json()
+            if not geo_data:
+                print(f"   ❌ Şehir bulunamadı: {city}")
+                return []
+
+            south, north, west, east = geo_data[0]["boundingbox"]
+
+            # Overpass QL sorgusu
+            query = f"""[out:json][timeout:30];
+(
+  node["{key}"="{value}"]({south},{west},{north},{east});
+  way["{key}"="{value}"]({south},{west},{north},{east});
+);
+out body 60;"""
+
+            await asyncio.sleep(1)  # Nominatim rate limit
+            ov = await client.post("https://overpass-api.de/api/interpreter", data=query)
+            elements = ov.json().get("elements", [])
+
+            leads = []
+            for el in elements:
+                tags = el.get("tags", {})
+                name = tags.get("name") or tags.get("name:tr", "")
+                if not name:
+                    continue
+                phone = tags.get("phone") or tags.get("contact:phone", "")
+                website = tags.get("website") or tags.get("contact:website", "")
+                street = tags.get("addr:street", "")
+                housenumber = tags.get("addr:housenumber", "")
+                address = f"{street} {housenumber}".strip() or city
+                leads.append({
+                    "name": name,
+                    "phone": phone,
+                    "website": website,
+                    "address": address,
+                    "city": city,
+                    "source": "openstreetmap",
+                })
+            return leads
+    except Exception as e:
+        print(f"   ❌ Overpass API hatası: {e}")
+        return []
 
 
 async def generate_sector_pitch(lead: dict, sector: dict, issues: list) -> str:
@@ -274,20 +343,25 @@ async def run(sector_name: str, city: str):
     sector = get_sector(sector_name)
     print(f"🔍 Sektör: {sector['key']} | Şehir: {city}")
 
-    # Google Places API ile ara
     leads = []
+
+    # 1. Google Places API (varsa — en detaylı veri)
     if GOOGLE_API_KEY:
-        print(f"🌐 Google Places API ile aranıyor: {sector['search_terms'][0]} {city}")
+        print(f"🌐 Google Places API ile aranıyor...")
         leads = await search_google_places(sector['search_terms'][0], city)
-        print(f"📊 {len(leads)} işletme bulundu")
-    else:
-        print("⚠️  GOOGLE_PLACES_API_KEY ayarlanmamış.")
-        print("   .env dosyasına ekleyin veya export GOOGLE_PLACES_API_KEY=... kullanın.")
-        print(f"   Manuel alternatif: https://www.google.com/maps/search/{sector['search_terms'][0]}+{city}")
-        return
+        if leads:
+            print(f"   ✅ Google Places: {len(leads)} işletme")
+
+    # 2. OpenStreetMap Overpass API (ücretsiz fallback)
+    if not leads and sector.get("osm_tag"):
+        print(f"🗺️  OpenStreetMap ile aranıyor (ücretsiz)...")
+        leads = await search_overpass(sector["osm_tag"], city)
+        if leads:
+            print(f"   ✅ OpenStreetMap: {len(leads)} işletme")
 
     if not leads:
         print("❌ Hiç lead bulunamadı.")
+        print(f"   İpucu: https://www.google.com/maps/search/{sector['search_terms'][0]}+{city}")
         return
 
     created = 0
